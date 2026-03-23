@@ -1,98 +1,44 @@
+import requests
 import json
-from web3 import Web3
-from typing import List, Dict, Any
-import asyncio
-import logging
+from typing import List, Dict
+from collections import deque
 
-class BlockchainCrawler:
-    def __init__(self, rpc_url: str):
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
-        self.logger = logging.getLogger(__name__)
-        self.watched_contracts: Dict[str, Dict] = {}
-        self.last_processed_block = self.w3.eth.block_number
-    
-    async def add_contract_to_watch(self, 
-                                   address: str, 
-                                   abi_path: str,
-                                   events_of_interest: List[str]) -> None:
-        """Add a smart contract to monitor for specific events"""
-        try:
-            with open(abi_path, 'r') as f:
-                contract_abi = json.load(f)
-            
-            contract = self.w3.eth.contract(
-                address=Web3.to_checksum_address(address),
-                abi=contract_abi
-            )
-            
-            self.watched_contracts[address] = {
-                'contract': contract,
-                'events': events_of_interest
-            }
-            self.logger.info(f'Added contract {address} to watch list')
-        except Exception as e:
-            self.logger.error(f'Failed to add contract {address}: {str(e)}')
-    
-    async def process_event(self, event: Dict[str, Any]) -> None:
-        """Process a smart contract event"""
-        event_name = event['event']
-        event_args = dict(event['args'])
-        tx_hash = event['transactionHash'].hex()
-        
-        self.logger.info(f'New event {event_name} detected:')
-        self.logger.info(f'Transaction: {tx_hash}')
-        self.logger.info(f'Arguments: {event_args}')
-        
-        # Here you can add custom logic to handle different types of events
-        # For example, storing in database, triggering actions, etc.
-    
-    async def scan_blocks(self, interval: int = 15) -> None:
-        """Continuously scan for new blocks and process events"""
-        while True:
-            try:
-                current_block = self.w3.eth.block_number
-                
-                if current_block > self.last_processed_block:
-                    for block_num in range(self.last_processed_block + 1, current_block + 1):
-                        for address, contract_data in self.watched_contracts.items():
-                            contract = contract_data['contract']
-                            events_of_interest = contract_data['events']
-                            
-                            for event_name in events_of_interest:
-                                event_filter = getattr(contract.events, event_name).create_filter(
-                                    fromBlock=block_num,
-                                    toBlock=block_num
-                                )
-                                
-                                for event in event_filter.get_all_entries():
-                                    await self.process_event(event)
-                    
-                    self.last_processed_block = current_block
-                    self.logger.info(f'Processed up to block {current_block}')
-                
-                await asyncio.sleep(interval)
-            
-            except Exception as e:
-                self.logger.error(f'Error in block scanning: {str(e)}')
-                await asyncio.sleep(interval)
-    
-    async def start_monitoring(self, interval: int = 15) -> None:
-        """Start the blockchain monitoring process"""
-        self.logger.info('Starting blockchain monitoring...')
-        await self.scan_blocks(interval)
+class DecentralizedCrawler:
+    def __init__(self, seed_urls: List[str], max_depth: int = 3):
+        self.seed_urls = seed_urls
+        self.max_depth = max_depth
+        self.visited_urls = set()
+        self.url_queue = deque(seed_urls)
 
-# Example usage:
-'''
-if __name__ == '__main__':
-    crawler = BlockchainCrawler('https://mainnet.infura.io/v3/YOUR-PROJECT-ID')
-    
-    async def main():
-        await crawler.add_contract_to_watch(
-            '0x123...', # Contract address
-            'abi/contract.json',
-            ['Transfer', 'Approval'] # Events to monitor
-        )
-        await crawler.start_monitoring()
-    
-    asyncio.run(main())
-'''
+    def crawl(self) -> List[Dict[str, any]]:
+        results = []
+        while self.url_queue and len(self.visited_urls) < self.max_depth:
+            url = self.url_queue.popleft()
+            if url not in self.visited_urls:
+                self.visited_urls.add(url)
+                try:
+                    response = requests.get(url)
+                    response.raise_for_status()
+                    data = response.json()
+                    results.append(data)
+                    for link in self.extract_links(data):
+                        self.url_queue.append(link)
+                except (requests.exceptions.RequestException, ValueError):
+                    pass
+        return results
+
+    def extract_links(self, data: Dict[str, any]) -> List[str]:
+        links = []
+        if isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, str) and value.startswith('http'):
+                    links.append(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        links.extend(self.extract_links(item))
+                elif isinstance(value, dict):
+                    links.extend(self.extract_links(value))
+        elif isinstance(data, list):
+            for item in data:
+                links.extend(self.extract_links(item))
+        return links
