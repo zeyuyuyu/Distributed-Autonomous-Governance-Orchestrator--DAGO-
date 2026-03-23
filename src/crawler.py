@@ -1,74 +1,98 @@
-import requests
-from bs4 import BeautifulSoup
-import hashlib
 import json
-import multiprocessing as mp
+from web3 import Web3
+from typing import List, Dict, Any
+import asyncio
+import logging
 
-class DistributedCrawler:
-    def __init__(self, seed_urls, max_depth=3, num_workers=4):
-        self.seed_urls = seed_urls
-        self.max_depth = max_depth
-        self.num_workers = num_workers
-        self.crawl_queue = mp.Queue()
-        self.content_queue = mp.Queue()
-        self.visited_urls = set()
-        self.crawl_depth = 0
-        
-    def crawl(self):
-        # Add seed URLs to the queue
-        for url in self.seed_urls:
-            self.crawl_queue.put((url, 0))
-        
-        # Start worker processes
-        processes = []
-        for _ in range(self.num_workers):
-            p = mp.Process(target=self.worker)
-            p.start()
-            processes.append(p)
-        
-        # Wait for all workers to finish
-        for p in processes:
-            p.join()
-        
-        # Process the content queue
-        while not self.content_queue.empty():
-            url, content = self.content_queue.get()
-            self.process_content(url, content)
+class BlockchainCrawler:
+    def __init__(self, rpc_url: str):
+        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        self.logger = logging.getLogger(__name__)
+        self.watched_contracts: Dict[str, Dict] = {}
+        self.last_processed_block = self.w3.eth.block_number
     
-    def worker(self):
+    async def add_contract_to_watch(self, 
+                                   address: str, 
+                                   abi_path: str,
+                                   events_of_interest: List[str]) -> None:
+        """Add a smart contract to monitor for specific events"""
+        try:
+            with open(abi_path, 'r') as f:
+                contract_abi = json.load(f)
+            
+            contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(address),
+                abi=contract_abi
+            )
+            
+            self.watched_contracts[address] = {
+                'contract': contract,
+                'events': events_of_interest
+            }
+            self.logger.info(f'Added contract {address} to watch list')
+        except Exception as e:
+            self.logger.error(f'Failed to add contract {address}: {str(e)}')
+    
+    async def process_event(self, event: Dict[str, Any]) -> None:
+        """Process a smart contract event"""
+        event_name = event['event']
+        event_args = dict(event['args'])
+        tx_hash = event['transactionHash'].hex()
+        
+        self.logger.info(f'New event {event_name} detected:')
+        self.logger.info(f'Transaction: {tx_hash}')
+        self.logger.info(f'Arguments: {event_args}')
+        
+        # Here you can add custom logic to handle different types of events
+        # For example, storing in database, triggering actions, etc.
+    
+    async def scan_blocks(self, interval: int = 15) -> None:
+        """Continuously scan for new blocks and process events"""
         while True:
             try:
-                url, depth = self.crawl_queue.get(block=False)
-            except mp.queues.Empty:
-                return
+                current_block = self.w3.eth.block_number
+                
+                if current_block > self.last_processed_block:
+                    for block_num in range(self.last_processed_block + 1, current_block + 1):
+                        for address, contract_data in self.watched_contracts.items():
+                            contract = contract_data['contract']
+                            events_of_interest = contract_data['events']
+                            
+                            for event_name in events_of_interest:
+                                event_filter = getattr(contract.events, event_name).create_filter(
+                                    fromBlock=block_num,
+                                    toBlock=block_num
+                                )
+                                
+                                for event in event_filter.get_all_entries():
+                                    await self.process_event(event)
+                    
+                    self.last_processed_block = current_block
+                    self.logger.info(f'Processed up to block {current_block}')
+                
+                await asyncio.sleep(interval)
             
-            if depth > self.max_depth:
-                continue
-            
-            if url in self.visited_urls:
-                continue
-            
-            self.visited_urls.add(url)
-            content = self.fetch_content(url)
-            self.content_queue.put((url, content))
-            
-            for link in self.extract_links(content):
-                self.crawl_queue.put((link, depth + 1))
+            except Exception as e:
+                self.logger.error(f'Error in block scanning: {str(e)}')
+                await asyncio.sleep(interval)
     
-    def fetch_content(self, url):
-        response = requests.get(url)
-        return response.text
+    async def start_monitoring(self, interval: int = 15) -> None:
+        """Start the blockchain monitoring process"""
+        self.logger.info('Starting blockchain monitoring...')
+        await self.scan_blocks(interval)
+
+# Example usage:
+'''
+if __name__ == '__main__':
+    crawler = BlockchainCrawler('https://mainnet.infura.io/v3/YOUR-PROJECT-ID')
     
-    def extract_links(self, content):
-        soup = BeautifulSoup(content, 'html.parser')
-        return [link.get('href') for link in soup.find_all('a')]
+    async def main():
+        await crawler.add_contract_to_watch(
+            '0x123...', # Contract address
+            'abi/contract.json',
+            ['Transfer', 'Approval'] # Events to monitor
+        )
+        await crawler.start_monitoring()
     
-    def process_content(self, url, content):
-        # Implement content analysis logic here
-        print(f'Processed content from {url}')
-        # Example: Calculate a content hash
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        print(f'Content hash: {content_hash}')
-        # Save the content or perform other actions
-        with open(f'{content_hash}.json', 'w') as f:
-            json.dump({'url': url, 'content': content}, f)
+    asyncio.run(main())
+'''
