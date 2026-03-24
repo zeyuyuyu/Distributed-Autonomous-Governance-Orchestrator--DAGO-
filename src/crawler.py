@@ -1,44 +1,107 @@
-import requests
-import json
-from typing import List, Dict
-from collections import deque
+import asyncio
+from web3 import Web3
+from typing import List, Dict, Optional
+import logging
 
-class DecentralizedCrawler:
-    def __init__(self, seed_urls: List[str], max_depth: int = 3):
-        self.seed_urls = seed_urls
-        self.max_depth = max_depth
-        self.visited_urls = set()
-        self.url_queue = deque(seed_urls)
+class Web3Crawler:
+    def __init__(self, rpc_endpoint: str):
+        self.w3 = Web3(Web3.HTTPProvider(rpc_endpoint))
+        self.logger = logging.getLogger(__name__)
 
-    def crawl(self) -> List[Dict[str, any]]:
-        results = []
-        while self.url_queue and len(self.visited_urls) < self.max_depth:
-            url = self.url_queue.popleft()
-            if url not in self.visited_urls:
-                self.visited_urls.add(url)
-                try:
-                    response = requests.get(url)
-                    response.raise_for_status()
-                    data = response.json()
-                    results.append(data)
-                    for link in self.extract_links(data):
-                        self.url_queue.append(link)
-                except (requests.exceptions.RequestException, ValueError):
-                    pass
-        return results
+    async def crawl_contracts(self,
+                            start_block: int,
+                            end_block: Optional[int] = None,
+                            filters: Optional[Dict] = None) -> List[Dict]:
+        """Crawls blockchain for smart contracts matching specified filters
 
-    def extract_links(self, data: Dict[str, any]) -> List[str]:
-        links = []
-        if isinstance(data, dict):
-            for value in data.values():
-                if isinstance(value, str) and value.startswith('http'):
-                    links.append(value)
-                elif isinstance(value, list):
-                    for item in value:
-                        links.extend(self.extract_links(item))
-                elif isinstance(value, dict):
-                    links.extend(self.extract_links(value))
-        elif isinstance(data, list):
-            for item in data:
-                links.extend(self.extract_links(item))
-        return links
+        Args:
+            start_block: Starting block number
+            end_block: Ending block number (defaults to latest)
+            filters: Dict of contract criteria to filter by
+
+        Returns:
+            List of matching contract data
+        """
+        if not end_block:
+            end_block = self.w3.eth.block_number
+
+        contracts = []
+        
+        for block_num in range(start_block, end_block + 1):
+            try:
+                block = self.w3.eth.get_block(block_num, full_transactions=True)
+                
+                for tx in block.transactions:
+                    # Look for contract creation transactions
+                    if tx['to'] is None and tx['input']:
+                        contract_data = {
+                            'address': self.w3.eth.get_transaction_receipt(tx['hash'])['contractAddress'],
+                            'creator': tx['from'],
+                            'block': block_num,
+                            'timestamp': block.timestamp,
+                            'bytecode': tx['input']
+                        }
+
+                        if self._matches_filters(contract_data, filters):
+                            contracts.append(contract_data)
+                            
+                            self.logger.info(
+                                f"Found matching contract at {contract_data['address']}"
+                            )
+
+            except Exception as e:
+                self.logger.error(f"Error processing block {block_num}: {str(e)}")
+                continue
+
+            # Let other tasks run
+            await asyncio.sleep(0)
+            
+        return contracts
+
+    def _matches_filters(self, contract_data: Dict, filters: Optional[Dict]) -> bool:
+        """Check if contract matches all specified filters"""
+        if not filters:
+            return True
+
+        for key, value in filters.items():
+            if key not in contract_data:
+                return False
+            if contract_data[key] != value:
+                return False
+
+        return True
+
+    async def analyze_contract(self, address: str) -> Dict:
+        """Analyzes a specific contract address for key metrics"""
+        try:
+            code = self.w3.eth.get_code(address)
+            balance = self.w3.eth.get_balance(address)
+            tx_count = self.w3.eth.get_transaction_count(address)
+
+            return {
+                'address': address,
+                'code_size': len(code),
+                'balance': balance,
+                'transaction_count': tx_count
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error analyzing contract {address}: {str(e)}")
+            return {}
+
+    async def get_contract_events(self,
+                                address: str,
+                                from_block: int,
+                                to_block: Optional[int] = None) -> List[Dict]:
+        """Fetches all events emitted by a contract"""
+        try:
+            contract = self.w3.eth.contract(address=address)
+            events = await contract.events.get_all_entries(
+                fromBlock=from_block,
+                toBlock=to_block or 'latest'
+            )
+            return [dict(evt) for evt in events]
+
+        except Exception as e:
+            self.logger.error(f"Error getting events for {address}: {str(e)}")
+            return []
