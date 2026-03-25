@@ -1,107 +1,118 @@
 import asyncio
 from web3 import Web3
+from aiohttp import ClientSession
 from typing import List, Dict, Optional
+from datetime import datetime
 import logging
+from ratelimit import limits, sleep_and_retry
 
 class Web3Crawler:
-    def __init__(self, rpc_endpoint: str):
-        self.w3 = Web3(Web3.HTTPProvider(rpc_endpoint))
+    def __init__(self, rpc_endpoints: List[str], requests_per_second: int = 5):
+        self.rpcs = rpc_endpoints
+        self.current_rpc = 0
+        self.web3_instances = [Web3(Web3.HTTPProvider(rpc)) for rpc in rpc_endpoints]
+        self.requests_per_second = requests_per_second
         self.logger = logging.getLogger(__name__)
 
-    async def crawl_contracts(self,
-                            start_block: int,
-                            end_block: Optional[int] = None,
-                            filters: Optional[Dict] = None) -> List[Dict]:
-        """Crawls blockchain for smart contracts matching specified filters
+    @sleep_and_retry
+    @limits(calls=5, period=1)
+    async def _make_request(self, method: str, params: List) -> Optional[Dict]:
+        w3 = self.web3_instances[self.current_rpc]
+        try:
+            result = await w3.eth.call_method(method, params)
+            return result
+        except Exception as e:
+            self.logger.error(f'Error making request: {e}')
+            # Rotate to next RPC endpoint
+            self.current_rpc = (self.current_rpc + 1) % len(self.rpcs)
+            return None
 
-        Args:
-            start_block: Starting block number
-            end_block: Ending block number (defaults to latest)
-            filters: Dict of contract criteria to filter by
-
-        Returns:
-            List of matching contract data
-        """
-        if not end_block:
-            end_block = self.w3.eth.block_number
-
+    async def scan_contracts(self, start_block: int, end_block: int) -> List[Dict]:
+        """Scan blockchain for contract deployments and interactions"""
         contracts = []
         
         for block_num in range(start_block, end_block + 1):
             try:
-                block = self.w3.eth.get_block(block_num, full_transactions=True)
+                block = await self._make_request(
+                    'eth_getBlockByNumber',
+                    [hex(block_num), True]
+                )
                 
-                for tx in block.transactions:
-                    # Look for contract creation transactions
-                    if tx['to'] is None and tx['input']:
-                        contract_data = {
-                            'address': self.w3.eth.get_transaction_receipt(tx['hash'])['contractAddress'],
-                            'creator': tx['from'],
-                            'block': block_num,
-                            'timestamp': block.timestamp,
-                            'bytecode': tx['input']
-                        }
+                if not block:
+                    continue
 
-                        if self._matches_filters(contract_data, filters):
-                            contracts.append(contract_data)
-                            
-                            self.logger.info(
-                                f"Found matching contract at {contract_data['address']}"
-                            )
+                for tx in block['transactions']:
+                    # Look for contract creations
+                    if tx['to'] is None and tx['input'] != '0x':
+                        contract_addr = Web3.toChecksumAddress(
+                            Web3.keccak(rlp.encode([tx['from'], tx['nonce']]))[12:]
+                        )
+                        
+                        contracts.append({
+                            'address': contract_addr,
+                            'creator': tx['from'],
+                            'creation_block': block_num,
+                            'creation_tx': tx['hash'],
+                            'timestamp': datetime.fromtimestamp(block['timestamp'])
+                        })
+                        
+                        self.logger.info(
+                            f'Found contract deployment at {contract_addr}'
+                        )
 
             except Exception as e:
-                self.logger.error(f"Error processing block {block_num}: {str(e)}")
+                self.logger.error(
+                    f'Error scanning block {block_num}: {str(e)}'
+                )
                 continue
 
-            # Let other tasks run
-            await asyncio.sleep(0)
-            
         return contracts
 
-    def _matches_filters(self, contract_data: Dict, filters: Optional[Dict]) -> bool:
-        """Check if contract matches all specified filters"""
-        if not filters:
-            return True
-
-        for key, value in filters.items():
-            if key not in contract_data:
-                return False
-            if contract_data[key] != value:
-                return False
-
-        return True
+    async def get_contract_code(self, address: str) -> Optional[str]:
+        """Fetch contract bytecode and runtime code"""
+        try:
+            code = await self._make_request(
+                'eth_getCode',
+                [Web3.toChecksumAddress(address), 'latest']
+            )
+            return code
+        except Exception as e:
+            self.logger.error(f'Error fetching code for {address}: {e}')
+            return None
 
     async def analyze_contract(self, address: str) -> Dict:
-        """Analyzes a specific contract address for key metrics"""
-        try:
-            code = self.w3.eth.get_code(address)
-            balance = self.w3.eth.get_balance(address)
-            tx_count = self.w3.eth.get_transaction_count(address)
+        """Analyze contract code and interaction patterns"""
+        code = await self.get_contract_code(address)
+        if not code or code == '0x':
+            return {'error': 'No code at address'}
 
-            return {
-                'address': address,
-                'code_size': len(code),
-                'balance': balance,
-                'transaction_count': tx_count
-            }
+        # Basic analysis of bytecode
+        analysis = {
+            'address': address,
+            'code_size': len(code) // 2 - 1,  # Convert hex to bytes
+            'is_contract': True,
+            'features': []
+        }
 
-        except Exception as e:
-            self.logger.error(f"Error analyzing contract {address}: {str(e)}")
-            return {}
+        # Detect common patterns
+        if 'delegatecall' in code:
+            analysis['features'].append('proxy_capabilities')
+        if 'transfer' in code:
+            analysis['features'].append('token_capabilities') 
 
-    async def get_contract_events(self,
-                                address: str,
-                                from_block: int,
-                                to_block: Optional[int] = None) -> List[Dict]:
-        """Fetches all events emitted by a contract"""
-        try:
-            contract = self.w3.eth.contract(address=address)
-            events = await contract.events.get_all_entries(
-                fromBlock=from_block,
-                toBlock=to_block or 'latest'
-            )
-            return [dict(evt) for evt in events]
+        return analysis
 
-        except Exception as e:
-            self.logger.error(f"Error getting events for {address}: {str(e)}")
-            return []
+async def main():
+    # Example usage
+    crawler = Web3Crawler([
+        'https://mainnet.infura.io/v3/YOUR-PROJECT-ID',
+        'https://eth-mainnet.alchemyapi.io/v2/YOUR-API-KEY'
+    ])
+    
+    contracts = await crawler.scan_contracts(15000000, 15000100)
+    for contract in contracts:
+        analysis = await crawler.analyze_contract(contract['address'])
+        print(f'Contract Analysis: {analysis}')
+
+if __name__ == '__main__':
+    asyncio.run(main())
